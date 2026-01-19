@@ -88,6 +88,128 @@ function cssAngleToSvgVector(angleDeg) {
   };
 }
 
+/**
+ * Convert RGB to #RRGGBB.
+ */
+function rgbToHex(r, g, b) {
+  const to2 = (n) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0");
+  return `#${to2(r)}${to2(g)}${to2(b)}`;
+}
+
+/**
+ * Decode an image file into an HTMLImageElement.
+ * Keeps logic isolated for easier mocking/testing.
+ */
+async function decodeImageFromFile(file) {
+  const blobUrl = URL.createObjectURL(file);
+
+  try {
+    const img = new Image();
+    // Best-effort; for local object URLs this is not required, but doesn't hurt.
+    img.crossOrigin = "anonymous";
+
+    await new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Failed to load image."));
+      img.src = blobUrl;
+    });
+
+    return img;
+  } finally {
+    URL.revokeObjectURL(blobUrl);
+  }
+}
+
+/**
+ * Extract prominent colors from an image using a lightweight quantization approach:
+ * - Draw on an offscreen canvas scaled down to a manageable size.
+ * - Quantize RGB into reduced bins (e.g., 5 bits per channel).
+ * - Count frequency and return top N bins as representative colors.
+ */
+async function extractDominantColorsFromFile(file, options = {}) {
+  const { maxSize = 110, maxColors = 5, binSize = 8 } = options;
+
+  const img = await decodeImageFromFile(file);
+
+  const srcW = Math.max(1, img.naturalWidth || img.width || 1);
+  const srcH = Math.max(1, img.naturalHeight || img.height || 1);
+
+  // Guard against extremely large decode sizes: we always downscale for processing.
+  const scale = Math.min(maxSize / srcW, maxSize / srcH, 1);
+  const w = Math.max(1, Math.round(srcW * scale));
+  const h = Math.max(1, Math.round(srcH * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Canvas 2D context unavailable.");
+
+  // Draw scaled image
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  // Bin map: key => { count, rSum, gSum, bSum }
+  const bins = new Map();
+
+  const step = Math.max(1, Number(binSize) || 8);
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const a = data[i + 3];
+
+    // Skip fully transparent pixels
+    if (a < 16) continue;
+
+    // Quantize into bins (step is bucket size in [0..255])
+    const rq = Math.floor(r / step) * step;
+    const gq = Math.floor(g / step) * step;
+    const bq = Math.floor(b / step) * step;
+
+    const key = `${rq},${gq},${bq}`;
+
+    const existing = bins.get(key);
+    if (existing) {
+      existing.count += 1;
+      existing.rSum += r;
+      existing.gSum += g;
+      existing.bSum += b;
+    } else {
+      bins.set(key, { count: 1, rSum: r, gSum: g, bSum: b });
+    }
+  }
+
+  const sorted = Array.from(bins.entries())
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, maxColors);
+
+  // Convert bin averages to hex.
+  const colors = sorted.map(([, v]) => {
+    const r = v.rSum / v.count;
+    const g = v.gSum / v.count;
+    const b = v.bSum / v.count;
+    return rgbToHex(r, g, b);
+  });
+
+  // Ensure uniqueness but preserve order (different bins can average to same hex).
+  const unique = [];
+  const seen = new Set();
+  for (const c of colors) {
+    const k = c.toLowerCase();
+    if (!seen.has(k)) {
+      seen.add(k);
+      unique.push(c);
+    }
+  }
+
+  return unique.slice(0, maxColors);
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /** Selected color is kept as HEX to match <input type="color"> value format. */
@@ -115,6 +237,7 @@ function App() {
   );
   const cssSnippet = useMemo(() => `background: ${gradientCss};`, [gradientCss]);
 
+  // Toast system (already present): we reuse it for palette events too.
   const [copyStatus, setCopyStatus] = useState("");
   const copyTimerRef = useRef(null);
 
@@ -132,6 +255,31 @@ function App() {
     if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
     copyTimerRef.current = window.setTimeout(() => setCopyStatus(""), 1800);
   }
+
+  /** Palette-from-image state */
+  const paletteInputId = useId();
+  const [imageFile, setImageFile] = useState(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState("");
+  const [paletteColors, setPaletteColors] = useState([]);
+  const [isExtracting, setIsExtracting] = useState(false);
+
+  // Tracks which gradient stop should be set next from a swatch.
+  // On each swatch click: set A first, then B, and alternate.
+  const nextGradientStopRef = useRef("A");
+
+  useEffect(() => {
+    if (!imageFile) {
+      setImagePreviewUrl("");
+      return;
+    }
+
+    const url = URL.createObjectURL(imageFile);
+    setImagePreviewUrl(url);
+
+    return () => {
+      URL.revokeObjectURL(url);
+    };
+  }, [imageFile]);
 
   /**
    * Attempt to copy text to the user's clipboard.
@@ -304,6 +452,76 @@ function App() {
       announceToast("Exported SVG.");
     } catch (e) {
       announceToast("SVG export failed.");
+    }
+  }
+
+  function handleApplySwatch(hexColor) {
+    const normalized = String(hexColor || "").trim().toLowerCase();
+    const valid = normalized.match(/^#([0-9a-f]{6})$/i);
+    if (!valid) return;
+
+    // Update single color picker (always present in current UI).
+    setHex(normalized);
+
+    // Update gradient stops (stop A first, then B, alternate).
+    if (nextGradientStopRef.current === "A") {
+      setColorA(normalized);
+      nextGradientStopRef.current = "B";
+    } else {
+      setColorB(normalized);
+      nextGradientStopRef.current = "A";
+    }
+
+    announceToast(`Selected ${normalized.toUpperCase()}.`);
+  }
+
+  async function runExtraction() {
+    if (!imageFile) {
+      announceToast("Please choose an image first.");
+      return;
+    }
+
+    const maxBytes = 8 * 1024 * 1024; // 8MB guard
+    if (imageFile.size > maxBytes) {
+      announceToast("Image too large. Please choose a file under 8MB.");
+      return;
+    }
+
+    setIsExtracting(true);
+    announceToast("Extracting colors…");
+
+    try {
+      const colors = await extractDominantColorsFromFile(imageFile, {
+        maxSize: 110,
+        maxColors: 5,
+        binSize: 8,
+      });
+
+      setPaletteColors(colors);
+      announceToast(
+        colors.length
+          ? `Extracted ${colors.length} color${colors.length === 1 ? "" : "s"}.`
+          : "No prominent colors found."
+      );
+    } catch (e) {
+      setPaletteColors([]);
+      announceToast("Color extraction failed. Try another image.");
+    } finally {
+      setIsExtracting(false);
+    }
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files?.[0] || null;
+    setPaletteColors([]);
+    setImageFile(file);
+
+    // Small debounce so quick successive changes don't queue multiple extractions.
+    // We only auto-extract after a real selection.
+    if (file) {
+      window.setTimeout(() => {
+        runExtraction();
+      }, 120);
     }
   }
 
@@ -480,11 +698,91 @@ function App() {
                   </button>
                 </div>
 
-                {/* aria-live for action confirmation */}
+                {/* aria-live for action confirmation (also used by Palette from Image) */}
                 <span className="Toast" role="status" aria-live="polite">
                   {copyStatus}
                 </span>
               </div>
+            </div>
+          </section>
+
+          <section className="Card" aria-label="Palette from image card">
+            <header className="CardHeader">
+              <div className="HeaderText">
+                <h2 className="Title">Palette from Image</h2>
+                <p className="Subtitle">
+                  Upload an image to extract the top 5 prominent colors. Click a swatch to
+                  apply it to the color picker and gradient stops.
+                </p>
+              </div>
+
+              <div className="UploadRow">
+                <div className="UploadLeft">
+                  <label className="SrOnly" htmlFor={paletteInputId}>
+                    Upload image
+                  </label>
+                  <input
+                    id={paletteInputId}
+                    className="FileInput"
+                    type="file"
+                    accept="image/*"
+                    onChange={handleFileChange}
+                    aria-label="Upload image for palette extraction"
+                  />
+
+                  {imagePreviewUrl ? (
+                    <img
+                      className="Thumb"
+                      src={imagePreviewUrl}
+                      alt="Uploaded preview"
+                    />
+                  ) : (
+                    <div
+                      className="Thumb"
+                      aria-label="No image selected"
+                      role="img"
+                    />
+                  )}
+                </div>
+
+                <div className="ActionGroup" aria-label="Palette actions">
+                  <button
+                    type="button"
+                    className="Btn BtnSecondary"
+                    onClick={runExtraction}
+                    disabled={!imageFile || isExtracting}
+                    aria-label="Re-extract palette"
+                  >
+                    Re-extract
+                  </button>
+
+                  {isExtracting ? (
+                    <span className="LoadingNote" aria-label="Extracting colors">
+                      <span className="Spinner" aria-hidden="true" />
+                      Processing…
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            </header>
+
+            <div className="PaletteBody" aria-label="Extracted palette">
+              <div className="SwatchGrid" aria-label="Palette swatches">
+                {paletteColors.slice(0, 5).map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    className="SwatchBtn"
+                    style={{ background: c }}
+                    aria-label={`Select ${c.toUpperCase()}`}
+                    onClick={() => handleApplySwatch(c)}
+                  />
+                ))}
+              </div>
+
+              <p className="Subtitle" style={{ margin: 0 }}>
+                Tip: swatches set Color A first, then Color B (alternating).
+              </p>
             </div>
           </section>
         </div>
