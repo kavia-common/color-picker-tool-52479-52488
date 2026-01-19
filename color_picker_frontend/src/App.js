@@ -133,26 +133,46 @@ function App() {
     copyTimerRef.current = window.setTimeout(() => setCopyStatus(""), 1800);
   }
 
+  /**
+   * Attempt to copy text to the user's clipboard.
+   * Uses the async Clipboard API when available, otherwise falls back to
+   * document.execCommand("copy") with a hidden textarea.
+   */
+  async function copyToClipboard(text) {
+    // Prefer modern async clipboard API when present.
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    // Fallback for older browsers/environments.
+    const el = document.createElement("textarea");
+    el.value = text;
+
+    // readonly prevents iOS from popping up the keyboard in some cases.
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.top = "0";
+    el.style.left = "-9999px";
+
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+
+    if (!ok) {
+      throw new Error("Clipboard copy failed (fallback).");
+    }
+  }
+
   async function handleCopyCss() {
     try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(cssSnippet);
-      } else {
-        // Fallback for older browsers/environments
-        const el = document.createElement("textarea");
-        el.value = cssSnippet;
-        el.setAttribute("readonly", "");
-        el.style.position = "absolute";
-        el.style.left = "-9999px";
-        document.body.appendChild(el);
-        el.select();
-        document.execCommand("copy");
-        document.body.removeChild(el);
-      }
-
+      await copyToClipboard(cssSnippet);
       announceToast("Copied CSS to clipboard.");
     } catch (e) {
-      announceToast("Copy failed. Please select and copy manually.");
+      announceToast("Copy failed. Please try again.");
     }
   }
 
