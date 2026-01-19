@@ -135,44 +135,97 @@ function App() {
 
   /**
    * Attempt to copy text to the user's clipboard.
-   * Uses the async Clipboard API when available, otherwise falls back to
-   * document.execCommand("copy") with a hidden textarea.
+   *
+   * Strategy:
+   *  1) Prefer async Clipboard API when available *and* likely permitted (secure context).
+   *     - In some environments (http, iframe, or permission denied), writeText exists but rejects.
+   *       We catch and fall back instead of surfacing an error to the user.
+   *  2) Fallback to document.execCommand("copy") using a temporary textarea.
+   *  3) Final fallback: prompt-based manual copy if both fail.
    */
   async function copyToClipboard(text) {
-    // Prefer modern async clipboard API when present.
-    if (navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return;
+    const value = String(text ?? "");
+
+    // 1) Modern clipboard API (best-effort).
+    try {
+      const hasAsyncClipboard = Boolean(navigator?.clipboard?.writeText);
+      const isSecure =
+        // Prefer explicit secureContext flag when present; otherwise infer from protocol.
+        typeof window !== "undefined" && window.isSecureContext === true;
+
+      if (hasAsyncClipboard && isSecure) {
+        // Try to check permission when supported; ignore errors and still attempt writeText.
+        // Some browsers (or iframes) will throw here even before writeText.
+        try {
+          if (navigator?.permissions?.query) {
+            const res = await navigator.permissions.query({
+              // "clipboard-write" is supported in Chromium; other browsers may throw.
+              name: "clipboard-write",
+            });
+            if (res?.state === "denied") {
+              throw new Error("Clipboard permission denied.");
+            }
+          }
+        } catch (_ignoredPermissionError) {
+          // If permissions API is unavailable/blocked, still attempt writeText.
+        }
+
+        await navigator.clipboard.writeText(value);
+        return { method: "clipboard" };
+      }
+    } catch (_clipboardError) {
+      // Continue to fallback paths.
     }
 
-    // Fallback for older browsers/environments.
-    const el = document.createElement("textarea");
-    el.value = text;
+    // 2) execCommand fallback (works in many non-secure contexts).
+    try {
+      const el = document.createElement("textarea");
+      el.value = value;
 
-    // readonly prevents iOS from popping up the keyboard in some cases.
-    el.setAttribute("readonly", "");
-    el.style.position = "fixed";
-    el.style.top = "0";
-    el.style.left = "-9999px";
+      // readonly prevents iOS from popping up the keyboard in some cases.
+      el.setAttribute("readonly", "");
+      el.style.position = "fixed";
+      el.style.top = "0";
+      el.style.left = "-9999px";
+      el.style.opacity = "0";
 
-    document.body.appendChild(el);
-    el.focus();
-    el.select();
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
 
-    const ok = document.execCommand("copy");
-    document.body.removeChild(el);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(el);
 
-    if (!ok) {
-      throw new Error("Clipboard copy failed (fallback).");
+      if (ok) return { method: "execCommand" };
+    } catch (_execCommandError) {
+      // Continue to final fallback.
     }
+
+    // 3) Manual fallback. (prompt is crude, but reliable everywhere)
+    // Note: prompt may be blocked by some browsers; if so, throw.
+    const promptText =
+      "Copy this CSS snippet manually (Ctrl/Cmd+C), then press Enter:";
+    const res = window.prompt(promptText, value);
+
+    // If prompt is blocked it returns null; treat as failure.
+    if (res === null) {
+      throw new Error("Clipboard copy failed.");
+    }
+
+    return { method: "prompt" };
   }
 
   async function handleCopyCss() {
     try {
-      await copyToClipboard(cssSnippet);
-      announceToast("Copied CSS to clipboard.");
+      const result = await copyToClipboard(cssSnippet);
+
+      if (result.method === "prompt") {
+        announceToast("Clipboard unavailable. Paste from the prompt.");
+      } else {
+        announceToast("Copied CSS to clipboard.");
+      }
     } catch (e) {
-      announceToast("Copy failed. Please try again.");
+      announceToast("Copy failed. Select the CSS and copy manually.");
     }
   }
 
