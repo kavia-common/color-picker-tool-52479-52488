@@ -271,6 +271,14 @@
   gap: 12px;
 }
 
+/* Group multiple action buttons without changing overall layout */
+.ActionGroup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .Btn {
   appearance: none;
   border: 1px solid rgba(59, 130, 246, 0.35);

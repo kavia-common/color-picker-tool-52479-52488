@@ -29,6 +29,65 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
+/**
+ * Trigger a download for a given Blob.
+ */
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  // Let the click finish before revoking.
+  window.setTimeout(() => URL.revokeObjectURL(url), 250);
+}
+
+/**
+ * Convert a CSS linear-gradient "angle" (where 0deg is up, 90deg is right)
+ * into an SVG linearGradient vector (x1,y1,x2,y2 in objectBoundingBox space).
+ *
+ * In CSS:
+ *  - 0deg points "to top"
+ *  - 90deg points "to right"
+ *
+ * In SVG:
+ *  - x increases to the right
+ *  - y increases downward
+ *
+ * We map the direction into a vector and anchor it around the center.
+ */
+function cssAngleToSvgVector(angleDeg) {
+  const rad = (Number(angleDeg) * Math.PI) / 180;
+
+  // CSS "to top" at 0deg => direction (0,-1)
+  // Using:
+  //  x = sin(rad)
+  //  y = -cos(rad)
+  const dx = Math.sin(rad);
+  const dy = -Math.cos(rad);
+
+  // Convert to box endpoints around center (0.5, 0.5).
+  // 0.5 offset yields endpoints that cover the box for any angle.
+  const x1 = 0.5 - dx * 0.5;
+  const y1 = 0.5 - dy * 0.5;
+  const x2 = 0.5 + dx * 0.5;
+  const y2 = 0.5 + dy * 0.5;
+
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+  return {
+    x1: clamp01(x1),
+    y1: clamp01(y1),
+    x2: clamp01(x2),
+    y2: clamp01(y2),
+  };
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /** Selected color is kept as HEX to match <input type="color"> value format. */
@@ -54,10 +113,7 @@ function App() {
     () => `linear-gradient(${angle}deg, ${colorA}, ${colorB})`,
     [angle, colorA, colorB]
   );
-  const cssSnippet = useMemo(
-    () => `background: ${gradientCss};`,
-    [gradientCss]
-  );
+  const cssSnippet = useMemo(() => `background: ${gradientCss};`, [gradientCss]);
 
   const [copyStatus, setCopyStatus] = useState("");
   const copyTimerRef = useRef(null);
@@ -70,6 +126,12 @@ function App() {
       }
     };
   }, []);
+
+  function announceToast(message) {
+    setCopyStatus(message);
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopyStatus(""), 1800);
+  }
 
   async function handleCopyCss() {
     try {
@@ -88,12 +150,87 @@ function App() {
         document.body.removeChild(el);
       }
 
-      setCopyStatus("Copied CSS to clipboard.");
+      announceToast("Copied CSS to clipboard.");
     } catch (e) {
-      setCopyStatus("Copy failed. Please select and copy manually.");
-    } finally {
-      if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = window.setTimeout(() => setCopyStatus(""), 1800);
+      announceToast("Copy failed. Please select and copy manually.");
+    }
+  }
+
+  async function handleExportPng() {
+    try {
+      const width = 1920;
+      const height = 1080;
+
+      // Offscreen canvas render (no heavy deps)
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas 2D context unavailable.");
+
+      // Canvas uses radians and 0 rad points to the right; CSS 0deg points up.
+      // Convert by subtracting 90deg: CSS 90deg (to right) => 0rad
+      const rad = ((Number(angle) - 90) * Math.PI) / 180;
+
+      // Direction vector
+      const dx = Math.cos(rad);
+      const dy = Math.sin(rad);
+
+      // Compute endpoints across canvas center
+      const cx = width / 2;
+      const cy = height / 2;
+      const halfDiag = Math.sqrt(width * width + height * height) / 2;
+
+      const x1 = cx - dx * halfDiag;
+      const y1 = cy - dy * halfDiag;
+      const x2 = cx + dx * halfDiag;
+      const y2 = cy + dy * halfDiag;
+
+      const grd = ctx.createLinearGradient(x1, y1, x2, y2);
+      grd.addColorStop(0, colorA);
+      grd.addColorStop(1, colorB);
+
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, 0, width, height);
+
+      const blob = await new Promise((resolve) =>
+        canvas.toBlob(resolve, "image/png")
+      );
+
+      if (!blob) throw new Error("PNG export failed.");
+
+      downloadBlob(blob, "gradient.png");
+      announceToast("Exported PNG.");
+    } catch (e) {
+      announceToast("PNG export failed.");
+    }
+  }
+
+  function handleExportSvg() {
+    try {
+      const width = 1920;
+      const height = 1080;
+
+      const { x1, y1, x2, y2 } = cssAngleToSvgVector(angle);
+
+      // Note: encode minimal SVG with a rect fill.
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <defs>
+    <linearGradient id="g" gradientUnits="objectBoundingBox" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">
+      <stop offset="0%" stop-color="${colorA}" />
+      <stop offset="100%" stop-color="${colorB}" />
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="${width}" height="${height}" fill="url(#g)" />
+</svg>`;
+
+      const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+      downloadBlob(blob, "gradient.svg");
+      announceToast("Exported SVG.");
+    } catch (e) {
+      announceToast("SVG export failed.");
     }
   }
 
@@ -222,7 +359,10 @@ function App() {
             </header>
 
             <div className="SwatchWrap" aria-label="Gradient preview">
-              <div className="Swatch GradientSwatch" style={{ background: gradientCss }} />
+              <div
+                className="Swatch GradientSwatch"
+                style={{ background: gradientCss }}
+              />
             </div>
 
             <div className="GradientOutput" aria-label="Generated CSS">
@@ -239,12 +379,35 @@ function App() {
                 aria-readonly="true"
               />
 
-              <div className="Actions">
-                <button type="button" className="Btn" onClick={handleCopyCss}>
-                  Copy CSS
-                </button>
+              <div className="Actions" aria-label="Gradient actions">
+                <div className="ActionGroup" aria-label="Export actions">
+                  <button
+                    type="button"
+                    className="Btn"
+                    onClick={handleCopyCss}
+                    aria-label="Copy CSS"
+                  >
+                    Copy CSS
+                  </button>
+                  <button
+                    type="button"
+                    className="Btn"
+                    onClick={handleExportPng}
+                    aria-label="Export PNG"
+                  >
+                    Export PNG
+                  </button>
+                  <button
+                    type="button"
+                    className="Btn"
+                    onClick={handleExportSvg}
+                    aria-label="Export SVG"
+                  >
+                    Export SVG
+                  </button>
+                </div>
 
-                {/* aria-live for copy confirmation */}
+                {/* aria-live for action confirmation */}
                 <span className="Toast" role="status" aria-live="polite">
                   {copyStatus}
                 </span>

@@ -10,4 +10,6 @@ test("renders gradient generator section", () => {
   render(<App />);
   expect(screen.getByText(/gradient generator/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /copy css/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /export png/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /export svg/i })).toBeInTheDocument();
 });
